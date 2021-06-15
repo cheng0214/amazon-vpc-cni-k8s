@@ -2,19 +2,14 @@
 package ec2metadatawrapper
 
 import (
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 )
 
-const (
-	metadataRetries = 5
-)
-
 // TODO: Move away from using mock
 
-// HttpClient is used to help with testing
-type HttpClient interface {
+// HTTPClient is used to help with testing
+type HTTPClient interface {
 	GetInstanceIdentityDocument() (ec2metadata.EC2InstanceIdentityDocument, error)
 	Region() (string, error)
 }
@@ -26,18 +21,18 @@ type EC2MetadataClient interface {
 }
 
 type ec2MetadataClientImpl struct {
-	client HttpClient
+	client HTTPClient
 }
 
 // New creates an ec2metadata client to retrieve metadata
-func New(client HttpClient) EC2MetadataClient {
-	if client == nil {
-		awsSession := session.Must(session.NewSession(aws.NewConfig().
-			WithMaxRetries(metadataRetries),
-		))
-		return &ec2MetadataClientImpl{client: ec2metadata.New(awsSession)}
-	}
-	return &ec2MetadataClientImpl{client: client}
+func New(session *session.Session) EC2MetadataClient {
+	metadata := ec2metadata.New(session)
+	return NewMetadataService(metadata)
+}
+
+// NewMetadataService creates an ec2metadata client to retrieve metadata
+func NewMetadataService(metadata HTTPClient) EC2MetadataClient {
+	return &ec2MetadataClientImpl{client: metadata}
 }
 
 // InstanceIdentityDocument returns instance identity documents

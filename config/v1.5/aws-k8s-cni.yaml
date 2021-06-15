@@ -8,7 +8,6 @@ rules:
       - crd.k8s.amazonaws.com
     resources:
       - "*"
-      - namespaces
     verbs:
       - "*"
   - apiGroups: [""]
@@ -54,6 +53,8 @@ metadata:
 spec:
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: "10%"
   selector:
     matchLabels:
       k8s-app: aws-node
@@ -76,31 +77,34 @@ spec:
                     operator: In
                     values:
                       - amd64
+                  - key: eks.amazonaws.com/compute-type
+                    operator: NotIn
+                    values:
+                      - fargate
       serviceAccountName: aws-node
       hostNetwork: true
       tolerations:
         - operator: Exists
       containers:
-        - image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/amazon-k8s-cni:v1.5.5
-          imagePullPolicy: Always
+        - image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/amazon-k8s-cni:v1.5.7
           ports:
             - containerPort: 61678
               name: metrics
           name: aws-node
           #readinessProbe:
           #  exec:
-          #    command: ["/app/grpc_health_probe", "-addr=:50051"]
+          #    command: ["/app/grpc-health-probe", "-addr=:50051"]
           #  initialDelaySeconds: 25
           #livenessProbe:
           #  exec:
-          #    command: ["/app/grpc_health_probe", "-addr=:50051"]
+          #    command: ["/app/grpc-health-probe", "-addr=:50051"]
           #  initialDelaySeconds: 25
           env:
             - name: AWS_VPC_K8S_CNI_LOGLEVEL
               value: DEBUG
             - name: AWS_VPC_K8S_CNI_VETHPREFIX
               value: eni
-            - name: AWS_VPC_K8S_CNI_MTU
+            - name: AWS_VPC_ENI_MTU
               value: "9001"
             - name: MY_NODE_NAME
               valueFrom:

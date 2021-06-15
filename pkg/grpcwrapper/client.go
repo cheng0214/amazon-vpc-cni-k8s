@@ -1,4 +1,4 @@
-// Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -11,18 +11,21 @@
 // express or implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
+// Package grpcwrapper is a wrapper for the ipamd client Dial interface
 package grpcwrapper
 
 import (
 	google_grpc "google.golang.org/grpc"
 )
 
+// GRPC is the ipamd client Dial interface
 type GRPC interface {
 	Dial(target string, opts ...google_grpc.DialOption) (*google_grpc.ClientConn, error)
 }
 
 type cniGRPC struct{}
 
+// New creates a new cniGRPC
 func New() GRPC {
 	return &cniGRPC{}
 }

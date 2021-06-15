@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -20,11 +20,13 @@ import (
 	"time"
 )
 
+// Backoff is the backoff interface
 type Backoff interface {
 	Reset()
 	Duration() time.Duration
 }
 
+// SimpleBackoff is the default simple backoff
 type SimpleBackoff struct {
 	current        time.Duration
 	start          time.Duration
@@ -48,6 +50,7 @@ func NewSimpleBackoff(min, max time.Duration, jitterMultiple, multiple float64) 
 	}
 }
 
+// Duration gets the current duration including jitter
 func (sb *SimpleBackoff) Duration() time.Duration {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -56,6 +59,7 @@ func (sb *SimpleBackoff) Duration() time.Duration {
 	return AddJitter(ret, time.Duration(int64(float64(ret)*sb.jitterMultiple)))
 }
 
+// Reset resets the backoff
 func (sb *SimpleBackoff) Reset() {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()

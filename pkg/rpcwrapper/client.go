@@ -1,4 +1,4 @@
-// Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -11,6 +11,7 @@
 // express or implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
+// Package rpcwrapper is a wrapper for the CNI IPAMD pod connection
 package rpcwrapper
 
 import (
@@ -18,12 +19,14 @@ import (
 	grpc "google.golang.org/grpc"
 )
 
+// RPC is the wrapper interface for the CNI gRPC backend client
 type RPC interface {
 	NewCNIBackendClient(cc *grpc.ClientConn) rpc.CNIBackendClient
 }
 
 type cniRPC struct{}
 
+// New returns a new RPC
 func New() RPC {
 	return &cniRPC{}
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -14,9 +14,12 @@
 package awsutils
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
-	"sort"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -27,290 +30,145 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 
-	mock_ec2metadata "github.com/aws/amazon-vpc-cni-k8s/pkg/ec2metadata/mocks"
 	mock_ec2wrapper "github.com/aws/amazon-vpc-cni-k8s/pkg/ec2wrapper/mocks"
 )
 
 const (
-	az            = "us-east-1a"
-	localIP       = "10.0.0.10"
-	instanceID    = "i-0e1f3b9eb950e4980"
-	instanceType  = "c1.medium"
-	primaryMAC    = "12:ef:2a:98:e5:5a"
-	eni2MAC       = "12:ef:2a:98:e5:5b"
-	sg1           = "sg-2e080f50"
-	sg2           = "sg-2e080f51"
-	sgs           = sg1 + " " + sg2
-	subnetID      = "subnet-6b245523"
-	vpcCIDR       = "10.0.0.0/16"
-	subnetCIDR    = "10.0.1.0/24"
-	accountID     = "694065802095"
-	primaryeniID  = "eni-00000000"
-	eniID         = "eni-5731da78"
-	eniAttachID   = "eni-attach-beb21856"
-	eni1Device    = "0"
-	eni1PrivateIP = "10.0.0.1"
-	eni2Device    = "2"
-	eni2PrivateIP = "10.0.0.2"
-	eni2AttachID  = "eni-attach-fafdfafd"
-	eni2ID        = "eni-12341234"
-	ownerID       = "i-0946d8a24922d2852"
+	metadataMACPath      = "network/interfaces/macs/"
+	metadataMAC          = "mac"
+	metadataAZ           = "placement/availability-zone"
+	metadataLocalIP      = "local-ipv4"
+	metadataInstanceID   = "instance-id"
+	metadataInstanceType = "instance-type"
+	metadataSGs          = "/security-group-ids"
+	metadataSubnetID     = "/subnet-id"
+	metadataVPCcidrs     = "/vpc-ipv4-cidr-blocks"
+	metadataDeviceNum    = "/device-number"
+	metadataInterface    = "/interface-id"
+	metadataSubnetCIDR   = "/subnet-ipv4-cidr-block"
+	metadataIPv4s        = "/local-ipv4s"
+
+	az                   = "us-east-1a"
+	localIP              = "10.0.0.10"
+	instanceID           = "i-0e1f3b9eb950e4980"
+	instanceType         = "c1.medium"
+	primaryMAC           = "12:ef:2a:98:e5:5a"
+	eni2MAC              = "12:ef:2a:98:e5:5b"
+	sg1                  = "sg-2e080f50"
+	sg2                  = "sg-2e080f51"
+	sgs                  = sg1 + " " + sg2
+	subnetID             = "subnet-6b245523"
+	subnetCIDR           = "10.0.1.0/24"
+	primaryeniID         = "eni-00000000"
+	eniID                = primaryeniID
+	eniAttachID          = "eni-attach-beb21856"
+	eni1Device           = "0"
+	eni1PrivateIP        = "10.0.0.1"
+	eni2Device           = "1"
+	eni2PrivateIP        = "10.0.0.2"
+	eni2ID               = "eni-12341234"
+	metadataVPCIPv4CIDRs = "192.168.0.0/16	100.66.0.0/1"
 )
 
+func testMetadata(overrides map[string]interface{}) FakeIMDS {
+	data := map[string]interface{}{
+		metadataAZ:           az,
+		metadataLocalIP:      localIP,
+		metadataInstanceID:   instanceID,
+		metadataInstanceType: instanceType,
+		metadataMAC:          primaryMAC,
+		metadataMACPath:      primaryMAC,
+		metadataMACPath + primaryMAC + metadataDeviceNum:  eni1Device,
+		metadataMACPath + primaryMAC + metadataInterface:  primaryeniID,
+		metadataMACPath + primaryMAC + metadataSGs:        sgs,
+		metadataMACPath + primaryMAC + metadataIPv4s:      eni1PrivateIP,
+		metadataMACPath + primaryMAC + metadataSubnetID:   subnetID,
+		metadataMACPath + primaryMAC + metadataSubnetCIDR: subnetCIDR,
+		metadataMACPath + primaryMAC + metadataVPCcidrs:   metadataVPCIPv4CIDRs,
+	}
+
+	for k, v := range overrides {
+		data[k] = v
+	}
+
+	return FakeIMDS(data)
+}
+
 func setup(t *testing.T) (*gomock.Controller,
-	*mock_ec2metadata.MockEC2Metadata,
 	*mock_ec2wrapper.MockEC2) {
 	ctrl := gomock.NewController(t)
 	return ctrl,
-		mock_ec2metadata.NewMockEC2Metadata(ctrl),
 		mock_ec2wrapper.NewMockEC2(ctrl)
 }
 
 func TestInitWithEC2metadata(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
+	mockMetadata := testMetadata(nil)
 
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return("1", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return("1234", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSGs).Return(sgs, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSubnetID).Return(subnetID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataVPCcidr).Return(vpcCIDR, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataVPCcidrs).Return(vpcCIDR, nil)
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.NoError(t, err)
-	assert.Equal(t, az, ins.availabilityZone)
-	assert.Equal(t, localIP, ins.localIPv4)
-	assert.Equal(t, ins.instanceID, instanceID)
-	assert.Equal(t, ins.primaryENImac, primaryMAC)
-	assert.Equal(t, len(ins.securityGroups), 2)
-	assert.Equal(t, subnetID, ins.subnetID)
-	assert.Equal(t, vpcCIDR, ins.vpcIPv4CIDR)
+	ins := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, ec2SVC: mockEC2}
+	err := ins.initWithEC2Metadata(ctx)
+	if assert.NoError(t, err) {
+		assert.Equal(t, az, ins.availabilityZone)
+		assert.Equal(t, localIP, ins.localIPv4.String())
+		assert.Equal(t, ins.instanceID, instanceID)
+		assert.Equal(t, ins.primaryENImac, primaryMAC)
+		assert.Equal(t, ins.primaryENI, primaryeniID)
+		assert.Equal(t, subnetID, ins.subnetID)
+	}
 }
 
-func TestInitWithEC2metadataVPCcidrErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
+func TestInitWithEC2metadataErr(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return("1", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return("1234", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSGs).Return(sgs, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSubnetID).Return(subnetID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataVPCcidr).Return(vpcCIDR, errors.New("Error on VPCcidr"))
+	var keys []string
+	for k := range testMetadata(nil) {
+		keys = append(keys, k)
+	}
 
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
+	for _, key := range keys {
+		mockMetadata := testMetadata(map[string]interface{}{
+			key: fmt.Errorf("An error with %s", key),
+		})
 
-func TestInitWithEC2metadataSubnetErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
+		ins := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, ec2SVC: mockEC2}
 
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return("1", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return("1234", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSGs).Return(sgs, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSubnetID).Return(subnetID, errors.New("Error on Subnet"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataSGErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return("1", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return("1234", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSGs).Return(sgs, errors.New("Error on SG"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataENIErrs(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return("", errors.New("Err on ENIs"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataMACErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, errors.New("Error on MAC"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataLocalIPErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, errors.New("Error on localIP"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataInstanceErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, errors.New("Error on instanceID"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestInitWithEC2metadataAZErr(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, errors.New("Error on metadata AZ"))
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	err := ins.initWithEC2Metadata()
-	assert.Error(t, err)
-}
-
-func TestSetPrimaryENs(t *testing.T) {
-	ctrl, mockMetadata, _ := setup(t)
-	defer ctrl.Finish()
-
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC+" "+eni2MAC, nil)
-
-	gomock.InOrder(
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return(eni1Device, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return(ownerID, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryeniID, nil),
-	)
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata}
-	ins.primaryENImac = primaryMAC
-	err := ins.setPrimaryENI()
-	assert.NoError(t, err)
-	assert.Equal(t, ins.primaryENI, primaryeniID)
+		// This test is a bit silly.  We expect broken metadata to result in an err return here.  But if the code is resilient and _succeeds_, then of course that's ok too.  Mostly we just want it not to panic.
+		assert.NotPanics(t, func() {
+			_ = ins.initWithEC2Metadata(ctx)
+		}, "Broken metadata %s resulted in panic", key)
+	}
 }
 
 func TestGetAttachedENIs(t *testing.T) {
-	ctrl, mockMetadata, mockEC2 := setup(t)
-	defer ctrl.Finish()
+	mockMetadata := testMetadata(map[string]interface{}{
+		metadataMACPath: primaryMAC + " " + eni2MAC,
+		metadataMACPath + eni2MAC + metadataDeviceNum:  eni2Device,
+		metadataMACPath + eni2MAC + metadataInterface:  eni2ID,
+		metadataMACPath + eni2MAC + metadataSubnetCIDR: subnetCIDR,
+		metadataMACPath + eni2MAC + metadataIPv4s:      eni2PrivateIP,
+	})
 
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC+" "+eni2MAC, nil)
-
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).
-		DoAndReturn(func(input *ec2.DescribeNetworkInterfacesInput) (*ec2.DescribeNetworkInterfacesOutput, error) {
-			output := []*ec2.NetworkInterface{}
-			for _, in := range input.NetworkInterfaceIds {
-				ip := ""
-				attachID := ""
-				switch *in {
-				case eniID:
-					ip, attachID = eni1PrivateIP, eniAttachID
-				case eni2ID:
-					ip, attachID = eni2PrivateIP, eni2AttachID
-				default:
-					panic("no such id " + *in)
-				}
-
-				output = append(output, &ec2.NetworkInterface{
-					PrivateIpAddresses: []*ec2.NetworkInterfacePrivateIpAddress{
-						{
-							PrivateIpAddress: &ip,
-						},
-					},
-					Attachment: &ec2.NetworkInterfaceAttachment{
-						AttachmentId: &attachID,
-					},
-					TagSet: []*ec2.Tag{
-						{
-							Key:   aws.String("foo"),
-							Value: aws.String("foo-value"),
-						},
-					},
-				})
-			}
-			return &ec2.DescribeNetworkInterfacesOutput{
-				NetworkInterfaces: output,
-			}, nil
-		}).Times(2)
-
-	gomock.InOrder(
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return(eni1Device, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(eniID, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSubnetCIDR).Return(subnetCIDR, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataIPv4s).Return("", nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+eni2MAC+metadataDeviceNum).Return(eni2Device, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+eni2MAC+metadataInterface).Return(eni2ID, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+eni2MAC+metadataSubnetCIDR).Return(subnetCIDR, nil),
-		mockMetadata.EXPECT().GetMetadata(metadataMACPath+eni2MAC+metadataIPv4s).Return("", nil),
-	)
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata, ec2SVC: mockEC2}
+	ins := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}}
 	ens, err := ins.GetAttachedENIs()
-	assert.NoError(t, err)
-	assert.Equal(t, len(ens), 2)
+	if assert.NoError(t, err) {
+		assert.Equal(t, len(ens), 2)
+	}
 }
 
 func TestAWSGetFreeDeviceNumberOnErr(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	// test error handling
-	mockEC2.EXPECT().DescribeInstances(gomock.Any()).Return(nil, errors.New("Error on DescribeInstances"))
+	mockEC2.EXPECT().DescribeInstancesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("error on DescribeInstancesWithContext"))
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
 	_, err := ins.awsGetFreeDeviceNumber()
@@ -318,320 +176,335 @@ func TestAWSGetFreeDeviceNumberOnErr(t *testing.T) {
 }
 
 func TestAWSGetFreeDeviceNumberNoDevice(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	// test no free index
 	ec2ENIs := make([]*ec2.InstanceNetworkInterface, 0)
-	ownerID := accountID
 
 	for i := 0; i < maxENIs; i++ {
 		var deviceNums [maxENIs]int64
 		deviceNums[i] = int64(i)
-		ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNums[i]},
-			OwnerId: &ownerID}
+		ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNums[i]}}
 		ec2ENIs = append(ec2ENIs, ec2ENI)
 	}
 	result := &ec2.DescribeInstancesOutput{
 		Reservations: []*ec2.Reservation{{Instances: []*ec2.Instance{{NetworkInterfaces: ec2ENIs}}}}}
 
-	mockEC2.EXPECT().DescribeInstances(gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DescribeInstancesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
 	_, err := ins.awsGetFreeDeviceNumber()
 	assert.Error(t, err)
 }
 
-func TestDescribeENI(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+func TestGetENIAttachmentID(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	attachmentID := eniAttachID
-	attachment := &ec2.NetworkInterfaceAttachment{AttachmentId: &attachmentID}
+	attachmentID := aws.String("foo-attach")
+	testCases := []struct {
+		name   string
+		output *ec2.DescribeNetworkInterfacesOutput
+		awsErr error
+		expID  *string
+		expErr error
+	}{
+		{
+			"success with attachment",
+			&ec2.DescribeNetworkInterfacesOutput{
+				NetworkInterfaces: []*ec2.NetworkInterface{{
+					Attachment: &ec2.NetworkInterfaceAttachment{
+						AttachmentId: attachmentID,
+					},
+				}},
+			},
+			nil,
+			attachmentID,
+			nil,
+		},
+		{
+			"success no Attachment",
+			&ec2.DescribeNetworkInterfacesOutput{
+				NetworkInterfaces: []*ec2.NetworkInterface{{}},
+			},
+			nil,
+			nil,
+			nil,
+		},
+		{
+			"error empty net ifaces",
+			&ec2.DescribeNetworkInterfacesOutput{
+				NetworkInterfaces: []*ec2.NetworkInterface{},
+			},
+			nil,
+			nil,
+			ErrNoNetworkInterfaces,
+		},
+		{
+			"not found error",
+			nil,
+			awserr.New("InvalidNetworkInterfaceID.NotFound", "", nil),
+			nil,
+			ErrENINotFound,
+		},
+	}
+
+	for _, tc := range testCases {
+		mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(tc.output, tc.awsErr)
+
+		ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+		id, err := ins.getENIAttachmentID("test-eni")
+		assert.Equal(t, tc.expErr, err)
+		assert.Equal(t, tc.expID, id)
+	}
+}
+
+func TestDescribeAllENIs(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+
 	result := &ec2.DescribeNetworkInterfacesOutput{
 		NetworkInterfaces: []*ec2.NetworkInterface{{
-			Attachment: attachment,
 			TagSet: []*ec2.Tag{
 				{Key: aws.String("foo"), Value: aws.String("foo-value")},
+			},
+			Attachment: &ec2.NetworkInterfaceAttachment{
+				NetworkCardIndex: aws.Int64(0),
 			},
 		}},
 	}
 
+	expectedError := awserr.New("InvalidNetworkInterfaceID.NotFound", "no 'eni-xxx'", nil)
+	noMessageError := awserr.New("InvalidNetworkInterfaceID.NotFound", "no message", nil)
+	err := errors.New("other Error")
+
 	testCases := []struct {
 		name    string
-		expID   *string
-		exptags map[string]string
+		exptags map[string]TagMap
+		n       int
 		awsErr  error
 		expErr  error
 	}{
-		{"success DescribeENI", &attachmentID, map[string]string{"foo": "foo-value"}, nil, nil},
-		{"not found error", nil, nil, awserr.New("InvalidNetworkInterfaceID.NotFound", "", nil), ErrENINotFound},
+		{"Success DescribeENI", map[string]TagMap{"": {"foo": "foo-value"}}, 1, nil, nil},
+		{"Not found error", nil, maxENIEC2APIRetries, awserr.New("InvalidNetworkInterfaceID.NotFound", "no 'eni-xxx'", nil), expectedError},
+		{"Not found, no message", nil, maxENIEC2APIRetries, awserr.New("InvalidNetworkInterfaceID.NotFound", "no message", nil), noMessageError},
+		{"Other error", nil, maxENIEC2APIRetries, err, err},
 	}
+
+	mockMetadata := testMetadata(nil)
 
 	for _, tc := range testCases {
-		mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, tc.awsErr)
-
-		ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-		_, tags, id, err := ins.DescribeENI("test-eni")
+		mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Times(tc.n).Return(result, tc.awsErr)
+		ins := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, ec2SVC: mockEC2}
+		metaData, err := ins.DescribeAllENIs()
 		assert.Equal(t, tc.expErr, err, tc.name)
-		assert.Equal(t, tc.expID, id, tc.name)
-		assert.Equal(t, tc.exptags, tags, tc.name)
+		assert.Equal(t, tc.exptags, metaData.TagMap, tc.name)
 	}
-}
-
-func TestTagEni(t *testing.T) {
-	ctrl, mockMetadata, mockEC2 := setup(t)
-	defer ctrl.Finish()
-	mockMetadata.EXPECT().GetMetadata(metadataAZ).Return(az, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataLocalIP).Return(localIP, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceID).Return(instanceID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataInstanceType).Return(instanceType, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMAC).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataDeviceNum).Return("1", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataOwnerID).Return("1234", nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataInterface).Return(primaryMAC, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSGs).Return(sgs, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataSubnetID).Return(subnetID, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataVPCcidr).Return(vpcCIDR, nil)
-	mockMetadata.EXPECT().GetMetadata(metadataMACPath+primaryMAC+metadataVPCcidrs).Return(vpcCIDR, nil)
-
-	ins := &EC2InstanceMetadataCache{ec2Metadata: mockMetadata, ec2SVC: mockEC2}
-	err := ins.initWithEC2Metadata()
-	assert.NoError(t, err)
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, errors.New("Tagging Failed"))
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, errors.New("Tagging Failed"))
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, errors.New("Tagging Failed"))
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, errors.New("Tagging Failed"))
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, nil)
-	ins.tagENI(eniID)
-	assert.NoError(t, err)
-}
-
-func TestAdditionalTagsEni(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
-	defer ctrl.Finish()
-	os.Setenv(additionalEniTagsEnvVar, `{"testKey": "testing"}`)
-	cureniID := eniID
-	//result key
-	tagKey1 := "testKey"
-	//result value
-	tagValue1 := "testing"
-	tag := ec2.Tag{
-		Key:   &tagKey1,
-		Value: &tagValue1}
-	result := &ec2.DescribeNetworkInterfacesOutput{
-		NetworkInterfaces: []*ec2.NetworkInterface{{TagSet: []*ec2.Tag{&tag}}}}
-
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, nil)
-	ins.tagENI(cureniID)
-
-	// Verify the tags are registered.
-	assert.Equal(t, aws.StringValue(result.NetworkInterfaces[0].TagSet[0].Key), tagKey1)
-	assert.Equal(t, aws.StringValue(result.NetworkInterfaces[0].TagSet[0].Value), tagValue1)
-}
-
-func TestMapToTags(t *testing.T) {
-	tagKey1 := "tagKey1"
-	tagKey2 := "tagKey2"
-	tagValue1 := "tagValue1"
-	tagValue2 := "tagValue2"
-	tagKey3 := "cluster.k8s.amazonaws.com/name"
-	tagValue3 := "clusterName"
-	tagsMap := map[string]string{
-		tagKey1: tagValue1,
-		tagKey2: tagValue2,
-		tagKey3: tagValue3,
-	}
-	tags := make([]*ec2.Tag, 0)
-	tags = mapToTags(tagsMap, tags)
-	assert.Equal(t, 2, len(tags))
-	sort.Slice(tags, func(i, j int) bool {
-		return aws.StringValue(tags[i].Key) < aws.StringValue(tags[j].Key)
-	})
-
-	assert.Equal(t, aws.StringValue(tags[0].Key), tagKey1)
-	assert.Equal(t, aws.StringValue(tags[0].Value), tagValue1)
-	assert.Equal(t, aws.StringValue(tags[1].Key), tagKey2)
-	assert.Equal(t, aws.StringValue(tags[1].Value), tagValue2)
 }
 
 func TestAllocENI(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
+
+	mockMetadata := testMetadata(nil)
 
 	cureniID := eniID
 	eni := ec2.CreateNetworkInterfaceOutput{NetworkInterface: &ec2.NetworkInterface{NetworkInterfaceId: &cureniID}}
-	mockEC2.EXPECT().CreateNetworkInterface(gomock.Any()).Return(&eni, nil)
+	mockEC2.EXPECT().CreateNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(&eni, nil)
 
 	// 2 ENIs, uses device number 0 3, expect to find free at 1
 	ec2ENIs := make([]*ec2.InstanceNetworkInterface, 0)
 	deviceNum1 := int64(0)
-	ownerID := accountID
-	ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum1},
-		OwnerId: &ownerID}
+	ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum1}}
 	ec2ENIs = append(ec2ENIs, ec2ENI)
 
 	deviceNum2 := int64(3)
-	ownerID = accountID
-	ec2ENI = &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum2},
-		OwnerId: &ownerID}
+	ec2ENI = &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum2}}
 	ec2ENIs = append(ec2ENIs, ec2ENI)
 
 	result := &ec2.DescribeInstancesOutput{
 		Reservations: []*ec2.Reservation{{Instances: []*ec2.Instance{{NetworkInterfaces: ec2ENIs}}}}}
 
-	mockEC2.EXPECT().DescribeInstances(gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DescribeInstancesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
 	attachmentID := "eni-attach-58ddda9d"
 	attachResult := &ec2.AttachNetworkInterfaceOutput{
 		AttachmentId: &attachmentID}
-	mockEC2.EXPECT().AttachNetworkInterface(gomock.Any()).Return(attachResult, nil)
-	mockEC2.EXPECT().CreateTags(gomock.Any()).Return(nil, nil)
-	mockEC2.EXPECT().ModifyNetworkInterfaceAttribute(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().AttachNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(attachResult, nil)
+	mockEC2.EXPECT().ModifyNetworkInterfaceAttributeWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	ins := &EC2InstanceMetadataCache{
+		ec2SVC: mockEC2,
+		imds:   TypedIMDS{mockMetadata},
+	}
 	_, err := ins.AllocENI(false, nil, "")
 	assert.NoError(t, err)
 }
 
 func TestAllocENINoFreeDevice(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
+
+	mockMetadata := testMetadata(nil)
 
 	cureniID := eniID
 	eni := ec2.CreateNetworkInterfaceOutput{NetworkInterface: &ec2.NetworkInterface{NetworkInterfaceId: &cureniID}}
-	mockEC2.EXPECT().CreateNetworkInterface(gomock.Any()).Return(&eni, nil)
+	mockEC2.EXPECT().CreateNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(&eni, nil)
 
 	// test no free index
 	ec2ENIs := make([]*ec2.InstanceNetworkInterface, 0)
-	ownerID := accountID
 
 	for i := 0; i < maxENIs; i++ {
 		var deviceNums [maxENIs]int64
 		deviceNums[i] = int64(i)
-		ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNums[i]},
-			OwnerId: &ownerID}
+		ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNums[i]}}
 		ec2ENIs = append(ec2ENIs, ec2ENI)
 	}
 	result := &ec2.DescribeInstancesOutput{
 		Reservations: []*ec2.Reservation{{Instances: []*ec2.Instance{{NetworkInterfaces: ec2ENIs}}}}}
 
-	mockEC2.EXPECT().DescribeInstances(gomock.Any()).Return(result, nil)
-	mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DescribeInstancesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	ins := &EC2InstanceMetadataCache{
+		ec2SVC: mockEC2,
+		imds:   TypedIMDS{mockMetadata},
+	}
 	_, err := ins.AllocENI(false, nil, "")
 	assert.Error(t, err)
 }
 
 func TestAllocENIMaxReached(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
+
+	mockMetadata := testMetadata(nil)
 
 	cureniID := eniID
 	eni := ec2.CreateNetworkInterfaceOutput{NetworkInterface: &ec2.NetworkInterface{NetworkInterfaceId: &cureniID}}
-	mockEC2.EXPECT().CreateNetworkInterface(gomock.Any()).Return(&eni, nil)
+	mockEC2.EXPECT().CreateNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(&eni, nil)
 
 	// 2 ENIs, uses device number 0 3, expect to find free at 1
 	ec2ENIs := make([]*ec2.InstanceNetworkInterface, 0)
 	deviceNum1 := int64(0)
-	ownerID := accountID
-	ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum1},
-		OwnerId: &ownerID}
+	ec2ENI := &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum1}}
 	ec2ENIs = append(ec2ENIs, ec2ENI)
 
 	deviceNum2 := int64(3)
-	ownerID = accountID
-	ec2ENI = &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum2},
-		OwnerId: &ownerID}
+	ec2ENI = &ec2.InstanceNetworkInterface{Attachment: &ec2.InstanceNetworkInterfaceAttachment{DeviceIndex: &deviceNum2}}
 	ec2ENIs = append(ec2ENIs, ec2ENI)
 
 	result := &ec2.DescribeInstancesOutput{
 		Reservations: []*ec2.Reservation{{Instances: []*ec2.Instance{{NetworkInterfaces: ec2ENIs}}}}}
 
-	mockEC2.EXPECT().DescribeInstances(gomock.Any()).Return(result, nil)
-	mockEC2.EXPECT().AttachNetworkInterface(gomock.Any()).Return(nil, errors.New("AttachmentLimitExceeded"))
-	mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DescribeInstancesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().AttachNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("AttachmentLimitExceeded"))
+	mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	ins := &EC2InstanceMetadataCache{
+		ec2SVC: mockEC2,
+		imds:   TypedIMDS{mockMetadata},
+	}
 	_, err := ins.AllocENI(false, nil, "")
 	assert.Error(t, err)
 }
 
 func TestFreeENI(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	attachmentID := eniAttachID
 	attachment := &ec2.NetworkInterfaceAttachment{AttachmentId: &attachmentID}
 	result := &ec2.DescribeNetworkInterfacesOutput{
 		NetworkInterfaces: []*ec2.NetworkInterface{{Attachment: attachment}}}
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, nil)
-	mockEC2.EXPECT().DetachNetworkInterface(gomock.Any()).Return(nil, nil)
-	mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DetachNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	err := ins.freeENI("test-eni", time.Millisecond)
+	err := ins.freeENI("test-eni", time.Millisecond, time.Millisecond)
 	assert.NoError(t, err)
 }
 
 func TestFreeENIRetry(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	attachmentID := eniAttachID
 	attachment := &ec2.NetworkInterfaceAttachment{AttachmentId: &attachmentID}
 	result := &ec2.DescribeNetworkInterfacesOutput{
 		NetworkInterfaces: []*ec2.NetworkInterface{{Attachment: attachment}}}
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
 
 	// retry 2 times
-	mockEC2.EXPECT().DetachNetworkInterface(gomock.Any()).Return(nil, nil)
-	mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, errors.New("testing retrying delete"))
-	mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DetachNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("testing retrying delete"))
+	mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	err := ins.freeENI("test-eni", time.Millisecond)
+	err := ins.freeENI("test-eni", time.Millisecond, time.Millisecond)
 	assert.NoError(t, err)
 }
 
 func TestFreeENIRetryMax(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	attachmentID := eniAttachID
 	attachment := &ec2.NetworkInterfaceAttachment{AttachmentId: &attachmentID}
 	result := &ec2.DescribeNetworkInterfacesOutput{
 		NetworkInterfaces: []*ec2.NetworkInterface{{Attachment: attachment}}}
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, nil)
-	mockEC2.EXPECT().DetachNetworkInterface(gomock.Any()).Return(nil, nil)
+	mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(result, nil)
+	mockEC2.EXPECT().DetachNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
-	for i := 0; i < maxENIDeleteRetries; i++ {
-		mockEC2.EXPECT().DeleteNetworkInterface(gomock.Any()).Return(nil, errors.New("testing retrying delete"))
+	for i := 0; i < maxENIEC2APIRetries; i++ {
+		mockEC2.EXPECT().DeleteNetworkInterfaceWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("testing retrying delete"))
 	}
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	err := ins.freeENI("test-eni", time.Millisecond)
+	err := ins.freeENI("test-eni", time.Millisecond, time.Millisecond)
 	assert.Error(t, err)
 }
 
 func TestFreeENIDescribeErr(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(nil, errors.New("Error on DescribeNetworkInterfaces"))
+	mockEC2.EXPECT().DescribeNetworkInterfacesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("Error on DescribeNetworkInterfacesWithContext"))
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
 	err := ins.FreeENI("test-eni")
 	assert.Error(t, err)
 }
 
+func TestDescribeInstanceTypes(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+	mockEC2.EXPECT().DescribeInstanceTypesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(&ec2.DescribeInstanceTypesOutput{
+		InstanceTypes: []*ec2.InstanceTypeInfo{
+			{InstanceType: aws.String("not-there"), NetworkInfo: &ec2.NetworkInfo{
+				MaximumNetworkInterfaces:  aws.Int64(9),
+				Ipv4AddressesPerInterface: aws.Int64(99)},
+			},
+		},
+		NextToken: nil,
+	}, nil)
+
+	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
+	ins.instanceType = "not-there"
+	value, err := ins.GetENILimit()
+	assert.NoError(t, err)
+	assert.Equal(t, 9, value)
+	pv4Limit, err := ins.GetENIIPv4Limit()
+	assert.NoError(t, err)
+	assert.Equal(t, 98, pv4Limit)
+}
+
 func TestAllocIPAddress(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	mockEC2.EXPECT().AssignPrivateIpAddresses(gomock.Any()).Return(&ec2.AssignPrivateIpAddressesOutput{}, nil)
+	mockEC2.EXPECT().AssignPrivateIpAddressesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(&ec2.AssignPrivateIpAddressesOutput{}, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
 	err := ins.AllocIPAddress("eni-id")
@@ -639,10 +512,10 @@ func TestAllocIPAddress(t *testing.T) {
 }
 
 func TestAllocIPAddressOnErr(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	mockEC2.EXPECT().AssignPrivateIpAddresses(gomock.Any()).Return(nil, errors.New("Error on AssignPrivateIpAddresses"))
+	mockEC2.EXPECT().AssignPrivateIpAddressesWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("Error on AssignPrivateIpAddressesWithContext"))
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
 	err := ins.AllocIPAddress("eni-id")
@@ -650,78 +523,1014 @@ func TestAllocIPAddressOnErr(t *testing.T) {
 }
 
 func TestAllocIPAddresses(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
 	// when required IP numbers(5) is below ENI's limit(30)
 	input := &ec2.AssignPrivateIpAddressesInput{
-		NetworkInterfaceId:             aws.String("eni-id"),
+		NetworkInterfaceId:             aws.String(eniID),
 		SecondaryPrivateIpAddressCount: aws.Int64(5),
 	}
-	mockEC2.EXPECT().AssignPrivateIpAddresses(input).Return(nil, nil)
+	mockEC2.EXPECT().AssignPrivateIpAddressesWithContext(gomock.Any(), input, gomock.Any()).Return(nil, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2, instanceType: "c5n.18xlarge"}
-	err := ins.AllocIPAddresses("eni-id", 5)
+	err := ins.AllocIPAddresses(eniID, 5)
 	assert.NoError(t, err)
 
 	// when required IP numbers(50) is higher than ENI's limit(49)
 	input = &ec2.AssignPrivateIpAddressesInput{
-		NetworkInterfaceId:             aws.String("eni-id"),
+		NetworkInterfaceId:             aws.String(eniID),
 		SecondaryPrivateIpAddressCount: aws.Int64(49),
 	}
-	mockEC2.EXPECT().AssignPrivateIpAddresses(input).Return(nil, nil)
+	addresses := make([]*ec2.AssignedPrivateIpAddress, 49)
+	output := ec2.AssignPrivateIpAddressesOutput{
+		AssignedPrivateIpAddresses: addresses,
+		NetworkInterfaceId:         aws.String(eniID),
+	}
+	mockEC2.EXPECT().AssignPrivateIpAddressesWithContext(gomock.Any(), input, gomock.Any()).Return(&output, nil)
 
 	ins = &EC2InstanceMetadataCache{ec2SVC: mockEC2, instanceType: "c5n.18xlarge"}
-	err = ins.AllocIPAddresses("eni-id", 50)
+	err = ins.AllocIPAddresses(eniID, 50)
 	assert.NoError(t, err)
 
 	// Adding 0 should do nothing
-	err = ins.AllocIPAddresses("eni-id", 0)
+	err = ins.AllocIPAddresses(eniID, 0)
 	assert.NoError(t, err)
 }
 
-func TestEC2InstanceMetadataCache_getFilteredListOfNetworkInterfaces_OneResult(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
+func TestAllocIPAddressesAlreadyFull(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
+	defer ctrl.Finish()
+	// The required IP numbers(14) is the ENI's limit(14)
+	input := &ec2.AssignPrivateIpAddressesInput{
+		NetworkInterfaceId:             aws.String(eniID),
+		SecondaryPrivateIpAddressCount: aws.Int64(14),
+	}
+	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2, instanceType: "t3.xlarge"}
+
+	retErr := awserr.New("PrivateIpAddressLimitExceeded", "Too many IPs already allocated", nil)
+	mockEC2.EXPECT().AssignPrivateIpAddressesWithContext(gomock.Any(), input, gomock.Any()).Return(nil, retErr)
+	// If EC2 says that all IPs are already attached, we do nothing
+	err := ins.AllocIPAddresses(eniID, 14)
+	assert.NoError(t, err)
+}
+
+func Test_badENIID(t *testing.T) {
+	tests := []struct {
+		name   string
+		errMsg string
+		want   string
+	}{
+		{"Just a regular string", "Just a string", ""},
+		{"Actual error message", "The networkInterface ID 'eni-00000088' does not exist", "eni-00000088"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := badENIID(tt.errMsg); got != tt.want {
+				t.Errorf("badENIID() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEC2InstanceMetadataCache_waitForENIAndIPsAttached(t *testing.T) {
+	type args struct {
+		eni                string
+		foundSecondaryIPs  int
+		wantedSecondaryIPs int
+		maxBackoffDelay    time.Duration
+		times              int
+	}
+	eni1Metadata := ENIMetadata{
+		ENIID:         eniID,
+		IPv4Addresses: nil,
+	}
+	isPrimary := true
+	notPrimary := false
+	primaryIP := eni2PrivateIP
+	secondaryIP1 := primaryIP + "0"
+	secondaryIP2 := primaryIP + "1"
+	eni2Metadata := ENIMetadata{
+		ENIID:          eni2ID,
+		MAC:            eni2MAC,
+		DeviceNumber:   1,
+		SubnetIPv4CIDR: subnetCIDR,
+		IPv4Addresses: []*ec2.NetworkInterfacePrivateIpAddress{
+			{
+				Primary:          &isPrimary,
+				PrivateIpAddress: &primaryIP,
+			}, {
+				Primary:          &notPrimary,
+				PrivateIpAddress: &secondaryIP1,
+			}, {
+				Primary:          &notPrimary,
+				PrivateIpAddress: &secondaryIP2,
+			},
+		},
+	}
+	eniList := []ENIMetadata{eni1Metadata, eni2Metadata}
+	tests := []struct {
+		name            string
+		args            args
+		wantEniMetadata ENIMetadata
+		wantErr         bool
+	}{
+		{"Test wait success", args{eni: eni2ID, foundSecondaryIPs: 2, wantedSecondaryIPs: 2, maxBackoffDelay: 5 * time.Millisecond, times: 1}, eniList[1], false},
+		{"Test partial success", args{eni: eni2ID, foundSecondaryIPs: 2, wantedSecondaryIPs: 12, maxBackoffDelay: 5 * time.Millisecond, times: maxENIEC2APIRetries}, eniList[1], false},
+		{"Test wait fail", args{eni: eni2ID, foundSecondaryIPs: 0, wantedSecondaryIPs: 12, maxBackoffDelay: 5 * time.Millisecond, times: maxENIEC2APIRetries}, ENIMetadata{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl, mockEC2 := setup(t)
+			defer ctrl.Finish()
+			eniIPs := eni2PrivateIP
+			for i := 0; i < tt.args.foundSecondaryIPs; i++ {
+				eniIPs += " " + eni2PrivateIP + strconv.Itoa(i)
+			}
+			fmt.Println("eniips", eniIPs)
+			mockMetadata := testMetadata(map[string]interface{}{
+				metadataMACPath: primaryMAC + " " + eni2MAC,
+				metadataMACPath + eni2MAC + metadataDeviceNum:  eni2Device,
+				metadataMACPath + eni2MAC + metadataInterface:  eni2ID,
+				metadataMACPath + eni2MAC + metadataSubnetCIDR: subnetCIDR,
+				metadataMACPath + eni2MAC + metadataIPv4s:      eniIPs,
+			})
+			cache := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}, ec2SVC: mockEC2}
+			gotEniMetadata, err := cache.waitForENIAndIPsAttached(tt.args.eni, tt.args.wantedSecondaryIPs, tt.args.maxBackoffDelay)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("waitForENIAndIPsAttached() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(gotEniMetadata, tt.wantEniMetadata) {
+				t.Errorf("waitForENIAndIPsAttached() gotEniMetadata = %v, want %v", gotEniMetadata, tt.wantEniMetadata)
+			}
+		})
+	}
+}
+
+func TestEC2InstanceMetadataCache_SetUnmanagedENIs(t *testing.T) {
+	mockMetadata := testMetadata(nil)
+	ins := &EC2InstanceMetadataCache{imds: TypedIMDS{mockMetadata}}
+	ins.SetUnmanagedENIs(nil)
+	assert.False(t, ins.IsUnmanagedENI("eni-1"))
+	ins.SetUnmanagedENIs([]string{"eni-1", "eni-2"})
+	assert.True(t, ins.IsUnmanagedENI("eni-1"))
+	assert.False(t, ins.IsUnmanagedENI("eni-99"))
+	ins.SetUnmanagedENIs(nil)
+	assert.False(t, ins.IsUnmanagedENI("eni-1"))
+}
+
+func TestEC2InstanceMetadataCache_cleanUpLeakedENIsInternal(t *testing.T) {
+	ctrl, mockEC2 := setup(t)
 	defer ctrl.Finish()
 
-	attachmentID := eniAttachID
 	description := eniDescriptionPrefix + "test"
-	status := "available"
-	tagKey := eniNodeTagKey
-	tag := ec2.Tag{Key: &tagKey}
-	attachment := &ec2.NetworkInterfaceAttachment{AttachmentId: &attachmentID}
-	result := &ec2.DescribeNetworkInterfacesOutput{
-		NetworkInterfaces: []*ec2.NetworkInterface{{Attachment: attachment, Status: &status, TagSet: []*ec2.Tag{&tag}, Description: &description}}}
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, nil)
+	interfaces := []*ec2.NetworkInterface{{
+		Description: &description,
+		TagSet: []*ec2.Tag{
+			{Key: aws.String(eniNodeTagKey), Value: aws.String("test-value")},
+		},
+	}}
+
+	setupDescribeNetworkInterfacesPagesWithContextMock(t, mockEC2, interfaces, nil, 1)
+	mockEC2.EXPECT().CreateTagsWithContext(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
 
 	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	got, err := ins.getFilteredListOfNetworkInterfaces()
-	assert.NotNil(t, got)
-	assert.NoError(t, err)
+	// Test checks that both mocks gets called.
+	ins.cleanUpLeakedENIsInternal(time.Millisecond)
 }
 
-func TestEC2InstanceMetadataCache_getFilteredListOfNetworkInterfaces_NoResult(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
-	defer ctrl.Finish()
-
-	result := &ec2.DescribeNetworkInterfacesOutput{
-		NetworkInterfaces: []*ec2.NetworkInterface{}}
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(result, nil)
-
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	got, err := ins.getFilteredListOfNetworkInterfaces()
-	assert.Nil(t, got)
-	assert.NoError(t, err)
+func setupDescribeNetworkInterfacesPagesWithContextMock(
+	t *testing.T, mockEC2 *mock_ec2wrapper.MockEC2, interfaces []*ec2.NetworkInterface, err error, times int) {
+	mockEC2.EXPECT().
+		DescribeNetworkInterfacesPagesWithContext(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(times).
+		DoAndReturn(func(_ context.Context, _ *ec2.DescribeNetworkInterfacesInput,
+			fn func(*ec2.DescribeNetworkInterfacesOutput, bool) bool) error {
+			assert.Equal(t, true, fn(&ec2.DescribeNetworkInterfacesOutput{
+				NetworkInterfaces: interfaces,
+			}, true))
+			return err
+		})
 }
 
-func TestEC2InstanceMetadataCache_getFilteredListOfNetworkInterfaces_Error(t *testing.T) {
-	ctrl, _, mockEC2 := setup(t)
-	defer ctrl.Finish()
+func TestEC2InstanceMetadataCache_buildENITags(t *testing.T) {
+	type fields struct {
+		instanceID        string
+		clusterName       string
+		additionalENITags map[string]string
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   map[string]string
+	}{
+		{
+			name: "without clusterName or additionalENITags",
+			fields: fields{
+				instanceID: "i-xxxxx",
+			},
+			want: map[string]string{
+				"node.k8s.amazonaws.com/instance_id": "i-xxxxx",
+			},
+		},
+		{
+			name: "with clusterName",
+			fields: fields{
+				instanceID:  "i-xxxxx",
+				clusterName: "awesome-cluster",
+			},
+			want: map[string]string{
+				"node.k8s.amazonaws.com/instance_id": "i-xxxxx",
+				"cluster.k8s.amazonaws.com/name":     "awesome-cluster",
+			},
+		},
+		{
+			name: "with additional ENI tags",
+			fields: fields{
+				instanceID: "i-xxxxx",
+				additionalENITags: map[string]string{
+					"tagKey-1": "tagVal-1",
+					"tagKey-2": "tagVal-2",
+				},
+			},
+			want: map[string]string{
+				"node.k8s.amazonaws.com/instance_id": "i-xxxxx",
+				"tagKey-1":                           "tagVal-1",
+				"tagKey-2":                           "tagVal-2",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cache := &EC2InstanceMetadataCache{
+				instanceID:        tt.fields.instanceID,
+				clusterName:       tt.fields.clusterName,
+				additionalENITags: tt.fields.additionalENITags,
+			}
+			got := cache.buildENITags()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
 
-	mockEC2.EXPECT().DescribeNetworkInterfaces(gomock.Any()).Return(nil, errors.New("dummy error"))
+func TestEC2InstanceMetadataCache_getLeakedENIs(t *testing.T) {
+	tenMinuteAgo := time.Now().Local().Add(time.Minute * time.Duration(-10))
+	now := time.Now().Local()
+	type describeNetworkInterfacePagesCall struct {
+		input       *ec2.DescribeNetworkInterfacesInput
+		outputPages []*ec2.DescribeNetworkInterfacesOutput
+		err         error
+	}
+	type fields struct {
+		clusterName                        string
+		describeNetworkInterfacePagesCalls []describeNetworkInterfacePagesCall
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		want    []*ec2.NetworkInterface
+		wantErr error
+	}{
+		{
+			name: "without clusterName - no leaked ENIs",
+			fields: fields{
+				clusterName: "",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: nil,
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "without clusterName - one ENI leaked",
+			fields: fields{
+				clusterName: "",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("aws-K8S-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []*ec2.NetworkInterface{
+				{
+					NetworkInterfaceId: aws.String("eni-1"),
+					Description:        aws.String("aws-K8S-i-xxxxx"),
+					Status:             aws.String("available"),
+					TagSet: []*ec2.Tag{
+						{
+							Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+							Value: aws.String("i-xxxxx"),
+						},
+						{
+							Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+							Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "without clusterName - one ENI - description didn't match",
+			fields: fields{
+				clusterName: "",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("non-k8s-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "without clusterName - one ENI - creationTime within deletion coolDown",
+			fields: fields{
+				clusterName: "",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("aws-K8S-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(now.Format(time.RFC3339)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "without clusterName - no leaked ENIs",
+			fields: fields{
+				clusterName: "",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: nil,
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "with clusterName - one ENI leaked",
+			fields: fields{
+				clusterName: "awesome-cluster",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+								{
+									Name:   aws.String("tag:cluster.k8s.amazonaws.com/name"),
+									Values: []*string{aws.String("awesome-cluster")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("aws-K8S-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+											},
+											{
+												Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+												Value: aws.String("awesome-cluster"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []*ec2.NetworkInterface{
+				{
+					NetworkInterfaceId: aws.String("eni-1"),
+					Description:        aws.String("aws-K8S-i-xxxxx"),
+					Status:             aws.String("available"),
+					TagSet: []*ec2.Tag{
+						{
+							Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+							Value: aws.String("i-xxxxx"),
+						},
+						{
+							Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+							Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+						},
+						{
+							Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+							Value: aws.String("awesome-cluster"),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "with clusterName - one ENI - description didn't match",
+			fields: fields{
+				clusterName: "awesome-cluster",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+								{
+									Name:   aws.String("tag:cluster.k8s.amazonaws.com/name"),
+									Values: []*string{aws.String("awesome-cluster")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("non-k8s-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(tenMinuteAgo.Format(time.RFC3339)),
+											},
+											{
+												Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+												Value: aws.String("awesome-cluster"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "with clusterName - one ENI - creationTime within deletion coolDown",
+			fields: fields{
+				clusterName: "awesome-cluster",
+				describeNetworkInterfacePagesCalls: []describeNetworkInterfacePagesCall{
+					{
+						input: &ec2.DescribeNetworkInterfacesInput{
+							Filters: []*ec2.Filter{
+								{
+									Name:   aws.String("tag-key"),
+									Values: []*string{aws.String("node.k8s.amazonaws.com/instance_id")},
+								},
+								{
+									Name:   aws.String("status"),
+									Values: []*string{aws.String("available")},
+								},
+								{
+									Name:   aws.String("tag:cluster.k8s.amazonaws.com/name"),
+									Values: []*string{aws.String("awesome-cluster")},
+								},
+							},
+							MaxResults: aws.Int64(1000),
+						},
+						outputPages: []*ec2.DescribeNetworkInterfacesOutput{
+							{
+								NetworkInterfaces: []*ec2.NetworkInterface{
+									{
+										NetworkInterfaceId: aws.String("eni-1"),
+										Description:        aws.String("aws-K8S-i-xxxxx"),
+										Status:             aws.String("available"),
+										TagSet: []*ec2.Tag{
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+												Value: aws.String("i-xxxxx"),
+											},
+											{
+												Key:   aws.String("node.k8s.amazonaws.com/createdAt"),
+												Value: aws.String(now.Format(time.RFC3339)),
+											},
+											{
+												Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+												Value: aws.String("awesome-cluster"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl, mockEC2 := setup(t)
+			defer ctrl.Finish()
 
-	ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2}
-	got, err := ins.getFilteredListOfNetworkInterfaces()
-	assert.Nil(t, got)
-	assert.Error(t, err)
+			for _, call := range tt.fields.describeNetworkInterfacePagesCalls {
+				mockEC2.EXPECT().
+					DescribeNetworkInterfacesPagesWithContext(gomock.Any(), call.input, gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, _ *ec2.DescribeNetworkInterfacesInput,
+						fn func(*ec2.DescribeNetworkInterfacesOutput, bool) bool) error {
+						if call.err != nil {
+							return call.err
+						}
+						for _, output := range call.outputPages {
+							fn(output, true)
+						}
+						return nil
+					})
+			}
+			ins := &EC2InstanceMetadataCache{ec2SVC: mockEC2, clusterName: tt.fields.clusterName}
+			got, err := ins.getLeakedENIs()
+			if tt.wantErr != nil {
+				assert.EqualError(t, err, tt.wantErr.Error())
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestEC2InstanceMetadataCache_TagENI(t *testing.T) {
+	type createTagsCall struct {
+		input *ec2.CreateTagsInput
+		err   error
+	}
+	type fields struct {
+		instanceID        string
+		clusterName       string
+		additionalENITags map[string]string
+
+		createTagsCalls []createTagsCall
+	}
+	type args struct {
+		eniID       string
+		currentTags map[string]string
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		wantErr error
+	}{
+		{
+			name: "eni currently have no tags",
+			fields: fields{
+				instanceID:  "i-xxxx",
+				clusterName: "awesome-cluster",
+				createTagsCalls: []createTagsCall{
+					{
+						input: &ec2.CreateTagsInput{
+							Resources: []*string{aws.String("eni-xxxx")},
+							Tags: []*ec2.Tag{
+								{
+									Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+									Value: aws.String("awesome-cluster"),
+								},
+								{
+									Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+									Value: aws.String("i-xxxx"),
+								},
+							},
+						},
+					},
+				},
+			},
+			args: args{
+				eniID:       "eni-xxxx",
+				currentTags: nil,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "eni currently have all desired tags",
+			fields: fields{
+				instanceID:      "i-xxxx",
+				clusterName:     "awesome-cluster",
+				createTagsCalls: nil,
+			},
+			args: args{
+				eniID: "eni-xxxx",
+				currentTags: map[string]string{
+					"node.k8s.amazonaws.com/instance_id": "i-xxxx",
+					"cluster.k8s.amazonaws.com/name":     "awesome-cluster",
+				},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "eni currently have partial tags",
+			fields: fields{
+				instanceID:  "i-xxxx",
+				clusterName: "awesome-cluster",
+				createTagsCalls: []createTagsCall{
+					{
+						input: &ec2.CreateTagsInput{
+							Resources: []*string{aws.String("eni-xxxx")},
+							Tags: []*ec2.Tag{
+								{
+									Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+									Value: aws.String("awesome-cluster"),
+								},
+							},
+						},
+					},
+				},
+			},
+			args: args{
+				eniID: "eni-xxxx",
+				currentTags: map[string]string{
+					"node.k8s.amazonaws.com/instance_id": "i-xxxx",
+					"anotherKey":                         "anotherDay",
+				},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "create tags fails",
+			fields: fields{
+				instanceID:  "i-xxxx",
+				clusterName: "awesome-cluster",
+				createTagsCalls: []createTagsCall{
+					{
+						input: &ec2.CreateTagsInput{
+							Resources: []*string{aws.String("eni-xxxx")},
+							Tags: []*ec2.Tag{
+								{
+									Key:   aws.String("cluster.k8s.amazonaws.com/name"),
+									Value: aws.String("awesome-cluster"),
+								},
+								{
+									Key:   aws.String("node.k8s.amazonaws.com/instance_id"),
+									Value: aws.String("i-xxxx"),
+								},
+							},
+						},
+						err: errors.New("permission denied"),
+					},
+				},
+			},
+			args: args{
+				eniID:       "eni-xxxx",
+				currentTags: nil,
+			},
+			wantErr: errors.New("permission denied"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl, mockEC2 := setup(t)
+			defer ctrl.Finish()
+
+			for _, call := range tt.fields.createTagsCalls {
+				mockEC2.EXPECT().CreateTagsWithContext(gomock.Any(), call.input).Return(&ec2.CreateTagsOutput{}, call.err).AnyTimes()
+			}
+
+			cache := &EC2InstanceMetadataCache{
+				ec2SVC:            mockEC2,
+				instanceID:        tt.fields.instanceID,
+				clusterName:       tt.fields.clusterName,
+				additionalENITags: tt.fields.additionalENITags,
+			}
+			err := cache.TagENI(tt.args.eniID, tt.args.currentTags)
+			if tt.wantErr != nil {
+				assert.EqualError(t, err, tt.wantErr.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_convertTagsToSDKTags(t *testing.T) {
+	type args struct {
+		tags map[string]string
+	}
+	tests := []struct {
+		name string
+		args args
+		want []*ec2.Tag
+	}{
+		{
+			name: "non-empty tags",
+			args: args{
+				tags: map[string]string{
+					"keyA": "valueA",
+					"keyB": "valueB",
+				},
+			},
+			want: []*ec2.Tag{
+				{
+					Key:   aws.String("keyA"),
+					Value: aws.String("valueA"),
+				},
+				{
+					Key:   aws.String("keyB"),
+					Value: aws.String("valueB"),
+				},
+			},
+		},
+		{
+			name: "nil tags",
+			args: args{tags: nil},
+			want: nil,
+		},
+		{
+			name: "empty tags",
+			args: args{tags: map[string]string{}},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := convertTagsToSDKTags(tt.args.tags)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_convertSDKTagsToTags(t *testing.T) {
+	type args struct {
+		sdkTags []*ec2.Tag
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string]string
+	}{
+		{
+			name: "non-empty sdk tags",
+			args: args{
+				sdkTags: []*ec2.Tag{
+					{
+						Key:   aws.String("keyA"),
+						Value: aws.String("valueA"),
+					},
+					{
+						Key:   aws.String("keyB"),
+						Value: aws.String("valueB"),
+					},
+				},
+			},
+			want: map[string]string{
+				"keyA": "valueA",
+				"keyB": "valueB",
+			},
+		},
+		{
+			name: "nil sdk tags",
+			args: args{
+				sdkTags: nil,
+			},
+			want: nil,
+		},
+		{
+			name: "empty sdk tags",
+			args: args{
+				sdkTags: []*ec2.Tag{},
+			},
+			want: nil,
+		},
+		{
+			name: "nil sdk tag value",
+			args: args{
+				sdkTags: []*ec2.Tag{
+					{
+						Key:   aws.String("keyA"),
+						Value: nil,
+					},
+				},
+			},
+			want: map[string]string{
+				"keyA": "",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := convertSDKTagsToTags(tt.args.sdkTags)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func Test_loadAdditionalENITags(t *testing.T) {
+	tests := []struct {
+		name    string
+		envVars map[string]string
+		want    map[string]string
+	}{
+		{
+			name: "no ADDITIONAL_ENI_TAGS env",
+			envVars: map[string]string{
+				"ADDITIONAL_ENI_TAGS": "",
+			},
+			want: nil,
+		},
+		{
+			name: "ADDITIONAL_ENI_TAGS is valid format",
+			envVars: map[string]string{
+				"ADDITIONAL_ENI_TAGS": "{\"tagKey1\": \"tagVal1\"}",
+			},
+			want: map[string]string{
+				"tagKey1": "tagVal1",
+			},
+		},
+		{
+			name: "ADDITIONAL_ENI_TAGS is invalid format",
+			envVars: map[string]string{
+				"ADDITIONAL_ENI_TAGS": "xxxx",
+			},
+			want: nil,
+		},
+		{
+			name: "ADDITIONAL_ENI_TAGS is valid format but contains tags with restricted prefix",
+			envVars: map[string]string{
+				"ADDITIONAL_ENI_TAGS": "{\"bla.k8s.amazonaws.com\": \"bla\"}",
+			},
+			want: map[string]string{},
+		},
+		{
+			name: "ADDITIONAL_ENI_TAGS is valid format but contains valid tags and tags with restricted prefix",
+			envVars: map[string]string{
+				"ADDITIONAL_ENI_TAGS": "{\"bla.k8s.amazonaws.com\": \"bla\", \"tagKey1\": \"tagVal1\"}",
+			},
+			want: map[string]string{
+				"tagKey1": "tagVal1",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for key, value := range tt.envVars {
+				if value != "" {
+					os.Setenv(key, value)
+				} else {
+					os.Unsetenv(key)
+				}
+			}
+			got := loadAdditionalENITags()
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

@@ -9,7 +9,6 @@ rules:
   - crd.k8s.amazonaws.com
   resources:
   - "*"
-  - namespaces
   verbs:
   - "*"
 - apiGroups: [""]
@@ -54,6 +53,8 @@ metadata:
 spec:
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: "10%"
   selector:
     matchLabels:
       k8s-app: aws-node
@@ -70,7 +71,6 @@ spec:
       - operator: Exists
       containers:
       - image: 602401143452.dkr.ecr.us-west-2.amazonaws.com/amazon-k8s-cni:v1.3.4
-        imagePullPolicy: Always
         ports:
         - containerPort: 61678
           name: metrics

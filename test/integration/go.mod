@@ -1,6 +1,6 @@
 module github.com/aws/amazon-vpc-cni-k8s/test/integration
 
-go 1.12
+go 1.14
 
 replace k8s.io/api => k8s.io/api v0.0.0-20190819141258-3544db3b9e44
 
@@ -49,6 +49,8 @@ replace k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.0.0-20190819143045
 replace k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.0.0-20190819144209-f9ca4b649af0
 
 replace k8s.io/sample-controller => k8s.io/sample-controller v0.0.0-20190819143301-7c475f5e1313
+
+replace github.com/mholt/caddy => github.com/caddyserver/caddy v1.0.3
 
 require (
 	github.com/onsi/ginkgo v1.8.0

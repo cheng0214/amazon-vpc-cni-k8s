@@ -14,78 +14,123 @@
 # As mentioned above, Kubelet considers a CNI plugin "ready" when it sees the
 # binary and configuration file for the plugin in a well-known directory. For
 # the AWS VPC CNI plugin binary, we only want to copy the CNI plugin binary
-# into that well-known directory AFTER we have succeessfully started the IPAM
+# into that well-known directory AFTER we have successfully started the IPAM
 # daemon and know that it can connect to Kubernetes and the local EC2 metadata
 # service. This is why this entrypoint script exists; we start the IPAM daemon
 # and wait until we know it is up and running successfully before copying the
 # CNI plugin binary and its configuration file to the well-known directory that
 # Kubelet looks in.
 
+# turn on exit on subprocess error and exit on undefined variables
+set -eu
 # turn on bash's job control
 set -m
 
-# Check for all the required binaries before we go forward
-if [ ! -f aws-k8s-agent ]; then
-    echo "Required aws-k8s-agent executable not found."
-    exit 1
-fi
-if [ ! -f grpc_health_probe ]; then
-    echo "Required grpc_health_probe executable not found."
-    exit 1
-fi
-
-AGENT_LOG_PATH=${AGENT_LOG_PATH:-aws-k8s-agent.log}
-HOST_CNI_BIN_PATH=${HOST_CNI_BIN_PATH:-/host/opt/cni/bin}
-HOST_CNI_CONFDIR_PATH=${HOST_CNI_CONFDIR_PATH:-/host/etc/cni/net.d}
-
-# Checks for IPAM connectivity on localhost port 50051, retrying connectivity
-# check with a timeout of 36 seconds
-wait_for_ipam() {
-    local __sleep_time=0
-
-    until [ $__sleep_time -eq 8 ]; do
-        sleep $(( __sleep_time++ ))
-        if $(./grpc_health_probe -addr 127.0.0.1:50051 >/dev/null 2>&1); then
-            return 0
-        fi
-    done
-    return 1
+log_in_json() 
+{
+    FILENAME="${0##*/}"
+    LOGTYPE=$1
+    MSG=$2
+    TIMESTAMP=$(date +%FT%T.%3NZ)
+    printf '{"level":"%s","ts":"%s","caller":"%s","msg":"%s"}\n' "$LOGTYPE" "$TIMESTAMP" "$FILENAME" "$MSG"
 }
 
-echo -n "starting IPAM daemon in background ... "
-./aws-k8s-agent > "$AGENT_LOG_PATH" 2>&1 &
-echo "ok."
+validate_env_var()
+{
+    log_in_json info "Validating env variables ..."
+    if [[ "${AWS_VPC_K8S_PLUGIN_LOG_FILE,,}" == "stdout" ]]; then
+        log_in_json error "AWS_VPC_K8S_PLUGIN_LOG_FILE cannot be set to stdout"
+        exit 1     
+    fi 
 
-echo -n "checking for IPAM connectivity ... "
+    if [[ ${#AWS_VPC_K8S_CNI_VETHPREFIX} -gt 4 ]]; then
+        log_in_json error "AWS_VPC_K8S_CNI_VETHPREFIX cannot be longer than 4 characters"
+        exit 1
+    fi
 
-if ! wait_for_ipam; then
-    echo " failed."
-    echo "timed out waiting for IPAM daemon to start."
+    case ${AWS_VPC_K8S_CNI_VETHPREFIX} in
+        eth|vlan|lo)
+          log_in_json error "AWS_VPC_K8S_CNI_VETHPREFIX cannot be set to reserved values eth or vlan or lo"
+          exit 1
+          ;;
+    esac
+}
+
+# Check for all the required binaries before we go forward
+if [ ! -f aws-k8s-agent ]; then
+    log_in_json error "Required aws-k8s-agent executable not found."
+    exit 1
+fi
+if [ ! -f grpc-health-probe ]; then
+    log_in_json error "Required grpc-health-probe executable not found."
     exit 1
 fi
 
-echo "ok."
+AGENT_LOG_PATH=${AGENT_LOG_PATH:-"aws-k8s-agent.log"}
+HOST_CNI_BIN_PATH=${HOST_CNI_BIN_PATH:-"/host/opt/cni/bin"}
+HOST_CNI_CONFDIR_PATH=${HOST_CNI_CONFDIR_PATH:-"/host/etc/cni/net.d"}
+AWS_VPC_K8S_CNI_VETHPREFIX=${AWS_VPC_K8S_CNI_VETHPREFIX:-"eni"}
+AWS_VPC_ENI_MTU=${AWS_VPC_ENI_MTU:-"9001"}
+AWS_VPC_K8S_PLUGIN_LOG_FILE=${AWS_VPC_K8S_PLUGIN_LOG_FILE:-"/var/log/aws-routed-eni/plugin.log"}
+AWS_VPC_K8S_PLUGIN_LOG_LEVEL=${AWS_VPC_K8S_PLUGIN_LOG_LEVEL:-"Debug"}
 
-echo -n "copying CNI plugin binaries and config files ... "
+AWS_VPC_K8S_CNI_CONFIGURE_RPFILTER=${AWS_VPC_K8S_CNI_CONFIGURE_RPFILTER:-"true"}
 
-cp portmap "$HOST_CNI_BIN_PATH"
-cp aws-cni "$HOST_CNI_BIN_PATH"
-cp aws-cni-support.sh "$HOST_CNI_BIN_PATH"
+validate_env_var
 
-sed -i s/__VETHPREFIX__/"${AWS_VPC_K8S_CNI_VETHPREFIX:-"eni"}"/g 10-aws.conflist
-sed -i s/__MTU__/"${AWS_VPC_ENI_MTU:-"9001"}"/g 10-aws.conflist
-cp 10-aws.conflist "$HOST_CNI_CONFDIR_PATH"
+# Check for ipamd connectivity on localhost port 50051
+wait_for_ipam() {
+    while :
+    do
+        if ./grpc-health-probe -addr 127.0.0.1:50051 >/dev/null 2>&1; then
+            return 0
+        fi
+        # We sleep for 1 second between each retry
+        sleep 1
+    done
+}
 
-echo " ok."
+# If there is no init container, copy the required files
+if [[ "$AWS_VPC_K8S_CNI_CONFIGURE_RPFILTER" != "false" ]]; then
+    # Copy files
+    log_in_json info "Copying CNI plugin binaries ... "
+    PLUGIN_BINS="loopback portmap bandwidth aws-cni-support.sh"
+    for b in $PLUGIN_BINS; do
+        # Install the binary
+        install "$b" "$HOST_CNI_BIN_PATH"
+    done
+fi
+
+log_in_json info "Install CNI binary.."
+install aws-cni "$HOST_CNI_BIN_PATH"
+
+log_in_json info "Starting IPAM daemon in the background ... "
+./aws-k8s-agent | tee -i "$AGENT_LOG_PATH" 2>&1 &
+
+log_in_json info "Checking for IPAM connectivity ... "
+
+if ! wait_for_ipam; then
+    log_in_json error "Timed out waiting for IPAM daemon to start:"
+    cat "$AGENT_LOG_PATH" >&2
+    exit 1
+fi
+
+log_in_json info "Copying config file ... "
+
+# modify the static config to populate it with the env vars
+sed \
+  -e s~__VETHPREFIX__~"${AWS_VPC_K8S_CNI_VETHPREFIX}"~g \
+  -e s~__MTU__~"${AWS_VPC_ENI_MTU}"~g \
+  -e s~__PLUGINLOGFILE__~"${AWS_VPC_K8S_PLUGIN_LOG_FILE}"~g \
+  -e s~__PLUGINLOGLEVEL__~"${AWS_VPC_K8S_PLUGIN_LOG_LEVEL}"~g \
+  10-aws.conflist > "$HOST_CNI_CONFDIR_PATH/10-aws.conflist"
+
+log_in_json info "Successfully copied CNI plugin binary and config file."
 
 if [[ -f "$HOST_CNI_CONFDIR_PATH/aws.conf" ]]; then
     rm "$HOST_CNI_CONFDIR_PATH/aws.conf"
 fi
 
-# bring the aws-k8s-agent process back into the foreground
-echo "foregrounding IPAM daemon ... "
-fg %1 >/dev/null 2>&1 || $(echo "failed (process terminated)" && cat "$AGENT_LOG_PATH" && exit 1)
-
-# Best practice states we should send the container's CMD output to stdout, so
-# let's tee back up the log file into stdout
-cat "$AGENT_LOG_PATH"
+# Bring the aws-k8s-agent process back into the foreground
+log_in_json info "Foregrounding IPAM daemon ..."
+fg %1 >/dev/null 2>&1 || { log_in_json error "failed (process terminated)" && cat "$AGENT_LOG_PATH" && exit 1; }

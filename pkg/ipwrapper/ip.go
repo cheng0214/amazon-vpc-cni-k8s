@@ -1,4 +1,4 @@
-// Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -11,15 +11,17 @@
 // express or implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
+// Package ipwrapper is a wrapper interface for the containernetworking ip plugin
 package ipwrapper
 
 import (
 	"net"
 
-	"github.com/containernetworking/cni/pkg/ip"
+	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/vishvananda/netlink"
 )
 
+// IP is the wrapper interface for the containernetworking ip plugin
 type IP interface {
 	AddDefaultRoute(gw net.IP, dev netlink.Link) error
 }
@@ -27,6 +29,7 @@ type IP interface {
 type ipRoute struct {
 }
 
+// NewIP returns a new IP
 func NewIP() IP {
 	return &ipRoute{}
 }
